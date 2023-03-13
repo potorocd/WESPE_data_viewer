@@ -417,17 +417,18 @@ class MainApp(App):
         self.box6.add_widget(self.f6)
         self.box6.add_widget(f7)
         '''CREATE MAP BUTTON'''
-        create_map = Button(text="Calculate delay-energy map",
-                            bold=True,
-                            background_color=config.kivy_color_button,
-                            font_name=config.kivy_font,
-                            font_size=config.kivy_font_size_title,
-                            color=config.kivy_color_white,
-                            size_hint=(0.8, 1),
-                            pos_hint={"center_x": 0.5, "center_y": 0.5}
-                            )
-        create_map.bind(on_press=self.callback_2)
-        self.box7.add_widget(create_map)
+        self.create_map = Button(text="Calculate delay-energy map",
+                                 bold=True,
+                                 background_color=config.kivy_color_button,
+                                 font_name=config.kivy_font,
+                                 font_size=config.kivy_font_size_title,
+                                 color=config.kivy_color_white,
+                                 size_hint=(0.8, 1),
+                                 pos_hint={"center_x": 0.5, "center_y": 0.5}
+                                 )
+        self.create_map.bind(on_press=self.callback_2_0)
+        self.create_map.bind(on_release=self.callback_2)
+        self.box7.add_widget(self.create_map)
 
         self.map_mode = ToggleButton(
                                      text='Mode: Time delay',
@@ -988,6 +989,9 @@ class MainApp(App):
             print('Unable to open file(s)!')
             print('Full error message:')
             print(err)
+      
+    def callback_2_0(self, instance):
+        self.create_map.text = 'Loading...'
 
     def callback_2(self, instance):
         try:
@@ -1014,16 +1018,17 @@ class MainApp(App):
                 ordinate = 'delay'
 
             for i in self.batch.batch_list:
-                i.create_map(energy_step, delay_step, ordinate=ordinate)
+                i.create_map(energy_step, delay_step, ordinate=ordinate,
+                             save=config.save_nc)
                 if self.d5.state == 'down':
                     i.set_BE()
-                if self.d2.state == 'down':
-                    i.time_zero(t0)
-                    i.create_dif_map()
 
             self.batch.create_map()
             if self.d2.state == 'down':
                 self.batch.create_dif_map()
+
+            if self.d2.state == 'down':
+                self.batch.time_zero(t0)
 
             self.batch.ROI([0, self.batch.en_threshold], 'Energy axis')
             if config.matplotlib == 'qt':
@@ -1060,10 +1065,12 @@ class MainApp(App):
                            fig_height=self.fig_height)
             if config.matplotlib != 'qt':
                 plt.show()
+            self.create_map.text = "Calculate delay-energy map"
         except Exception as err:
-            print('Probably no data loaded!')
+            print('Unable to open file(s)!')
             print('Full error message:')
             print(err)
+            self.create_map.text = "Calculate delay-energy map"
 
     def callback_3(self, instance):
         try:

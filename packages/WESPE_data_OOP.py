@@ -26,6 +26,9 @@ from scipy.signal import savgol_filter
 import xarray as xr
 from PIL import Image, ImageDraw, ImageFont
 from lmfit.models import VoigtModel, ConstantModel
+import matplotlib.colors as colors
+
+from timeit import default_timer as timer
 
 # Dictionary for colors
 color_dict = {
@@ -156,6 +159,17 @@ class create_batch:
         short_info = [title, run_num, is_static_s, KE_s, mono_s]
         self.short_info = '\n'.join(short_info) + '\n\n'
 
+    def time_zero(self, t0=1328.2):
+        '''
+        Method for creating new array coordinate 'Delay relative t0'
+        after specification of the delay stage value considered as time zero.
+        '''
+        self.t0 = read_file.rounding(t0, self.delay_step)
+        t0_coord = self.t0 - self.delay_energy_map.coords['Delay stage values']
+        self.delay_energy_map.coords['Delay relative t0'] = t0_coord
+        self.delay_energy_map.coords['Delay'] = t0_coord
+        self.delay_energy_map.attrs['Time axis'] = 'Delay relative t0'
+
     def create_map(self):
         '''
         This method sums delay-energy maps of individual runs
@@ -175,11 +189,26 @@ class create_batch:
             concat_list = []
             for counter, i in enumerate(self.batch_list):
                 concat_list.append(i.delay_energy_map)
-            total_map = xr.concat(concat_list, dim='Delay', coords="minimal",
-                                  compat='override')
+            total_map = xr.combine_by_coords(concat_list, compat='override')
+            total_map.coords['Delay stage values'] = total_map.coords['Delay']
+            total_map = total_map.to_array(dim='variable', name=None)
+            total_map = total_map.sum(dim='variable')
+            total_map.attrs = attrs
+
         if np.min(total_map.values.shape) == 0:
             total_map.attrs['Merge successful'] = False
-        self.delay_energy_map = total_map
+
+        # Filter empty EDCs
+        y_check = total_map.sum('Energy', skipna=True)
+        y_check = y_check/total_map.coords['Energy'].shape[0]
+        remove_list = np.where(y_check < 1)
+        remove_list = y_check.coords['Delay'][remove_list]
+        for i in remove_list:
+            total_map = total_map.where(total_map['Delay'] != i, drop=True)
+
+        shape = total_map.coords['Delay'].values.shape[0]
+        total_map.coords['Delay index'] = ('Delay', np.arange(shape))
+        self.delay_energy_map = total_map.fillna(0)
         self.delay_energy_map_plot = self.delay_energy_map
 
     def create_dif_map(self):
@@ -188,8 +217,14 @@ class create_batch:
         -0.25 ps and subtracting it from the delay-energy map.
         '''
         attrs = self.delay_energy_map_plot.attrs
-        norm = self.delay_energy_map_plot.loc[-0.25:].mean('Delay')
-        self.delay_energy_map_dif = self.delay_energy_map - norm
+        t_axis_step = self.delay_energy_map_plot.coords['Delay'].values
+        try:
+            t_axis_step = abs(np.median(np.gradient(t_axis_step)))
+        except ValueError:
+            t_axis_step = 1
+        t_axis_step = int(-2.5*t_axis_step)
+        norm = self.delay_energy_map_plot.loc[t_axis_step:].mean('Delay')
+        self.delay_energy_map_dif = self.delay_energy_map_plot - norm
         self.delay_energy_map_dif.attrs = attrs
 
     def set_BE(self):
@@ -459,6 +494,31 @@ class create_batch:
             image_data = self.delay_energy_map_plot.values
             image_data_y = self.delay_energy_map_plot.coords['Delay'].values
             image_data_x = self.delay_energy_map_plot.coords['Energy'].values
+            if image_data.shape[0] == 1:
+                image_data = np.pad(image_data, [(1, 1), (0, 0)],
+                                    mode='constant')
+                image_data_y = [image_data_y[0]-1,
+                                image_data_y[0],
+                                image_data_y[0]+1]
+                image_data_y = np.array(image_data_y)
+            self.varied_y_step = False
+            if image_data_y.shape[0] > 1:
+                if np.around(np.std(np.gradient(image_data_y)), 3) > 0:
+                    self.varied_y_step = True
+                    image_data_y = np.arange(image_data_y.shape[0])
+                    self.image_data_y = image_data_y
+                    if self.delay_energy_map_plot.attrs['Time axis'] == 'Delay relative t0':
+                        pos_list = np.linspace(np.min(image_data_y),
+                                               np.max(image_data_y),
+                                               config.map_n_ticks_y,
+                                               dtype=int)
+                    else:
+                        pos_list = np.linspace(np.max(image_data_y),
+                                               np.min(image_data_y),
+                                               config.map_n_ticks_y,
+                                               dtype=int)
+                    label_list = self.delay_energy_map_plot.coords['Delay']
+                    label_list = label_list[pos_list].values
             self.map_z_max = np.nanmax(image_data)
             self.map_z_min = np.nanmin(image_data)
             self.map_z_tick = (self.map_z_max - self.map_z_min)/config.map_n_ticks_z
@@ -488,12 +548,25 @@ class create_batch:
             if self.map_x_tick == 0:
                 self.map_x_tick = 1
 
-            if self.delay_energy_map_plot.attrs['Time axis'] == 'Delay relative t0':
-                extent = [np.min(image_data_x), np.max(image_data_x),
-                          np.min(image_data_y), np.max(image_data_y)]
+            if self.delay_energy_map_plot.attrs['Energy axis'] == 'Kinetic energy':
+                x_start = np.min(image_data_x)
+                x_end = np.max(image_data_x)
             else:
-                extent = [np.min(image_data_x), np.max(image_data_x),
-                          np.max(image_data_y), np.min(image_data_y)]
+                x_start = np.max(image_data_x)
+                x_end = np.min(image_data_x)
+
+            if self.delay_energy_map_plot.attrs['Time axis'] == 'Delay stage values':
+                y_start = np.max(image_data_y)
+                y_end = np.min(image_data_y)
+            elif self.varied_y_step is True:
+                y_start = np.max(image_data_y)
+                y_end = np.min(image_data_y)
+            else:
+                y_start = np.min(image_data_y)
+                y_end = np.max(image_data_y)
+                
+            extent = [x_start, x_end,
+                      y_start, y_end]
 
             vmin = np.min(image_data)
             vmax = np.max(image_data)*config.map_scale
@@ -501,11 +574,20 @@ class create_batch:
             if vmin < 0:
                 vmin = vmin*config.map_scale
 
-            im1 = axs.imshow(image_data, origin='upper',
-                             extent=extent,
-                             vmin=vmin,
-                             vmax=vmax,
-                             cmap=config.cmap, aspect='auto')
+            TwoSlopeNorm = config.TwoSlopeNorm
+            if TwoSlopeNorm < 1 and TwoSlopeNorm > 0:
+                im1 = axs.imshow(image_data, origin='upper',
+                                 extent=extent,
+                                 cmap=config.cmap, aspect='auto',
+                                 norm = colors.TwoSlopeNorm(vmin=vmin,
+                                                            vcenter=TwoSlopeNorm*vmax,
+                                                            vmax=vmax))
+            else:
+                im1 = axs.imshow(image_data, origin='upper',
+                                 extent=extent,
+                                 vmin=vmin,
+                                 vmax=vmax,
+                                 cmap=config.cmap, aspect='auto')
 
             divider1 = make_axes_locatable(axs)
             cax1 = divider1.append_axes("right", size="3.5%", pad=0.09)
@@ -550,15 +632,26 @@ class create_batch:
                                fontsize=config.font_size_axis*0.8)
 
             if self.delay_energy_map_plot.attrs['Time axis'] == 'Delay relative t0':
-                axs.axhline(y=0, color=config.color_t0_line,
+                position = 0
+                if self.varied_y_step is True:
+                    coord = self.delay_energy_map_plot.coords['Delay']
+                    position = coord.sel(Delay=position, method="nearest")
+                    position = coord.where(coord == position, drop=True)
+                    position = position['Delay index'].values
+                axs.axhline(y=position, color=config.color_t0_line,
                             linewidth=config.line_width_t0_line,
                             alpha=config.line_op_t0_line/100,
                             linestyle=config.line_type_t0_line)
 
             # y axis
-            axs.yaxis.set_major_locator(MultipleLocator(self.map_y_tick))
-            axs.yaxis.set_minor_locator(MultipleLocator(self.map_y_tick /
-                                                        config.map_n_ticks_minor))
+            if self.varied_y_step is True:
+                decimals = read_file.decimal_n(self.map_y_tick)
+                label_list = [round(i, decimals) for i in label_list]
+                axs.set_yticks(pos_list, label_list)
+            else:
+                axs.yaxis.set_major_locator(MultipleLocator(self.map_y_tick))
+                axs.yaxis.set_minor_locator(MultipleLocator(self.map_y_tick /
+                                                            config.map_n_ticks_minor))
             # x axis
             axs.xaxis.set_major_locator(MultipleLocator(self.map_x_tick))
             axs.xaxis.set_minor_locator(MultipleLocator(self.map_x_tick /
@@ -744,6 +837,9 @@ class read_file:
             if self.ordinate != 'delay':
                 raise FileNotFoundError
 
+            if save != 'on':
+                raise FileNotFoundError
+
             with xr.open_dataset(save_path) as ds:
                 loaded_map = ds
 
@@ -776,96 +872,144 @@ class read_file:
             self.delay_energy_map = delay_energy_map
             self.delay_energy_map_plot = self.delay_energy_map
         except FileNotFoundError:
+            start = timer()
+            '''
+            This part is supposed to filter artifact values
+            in the energy domain.
+            '''
+            for j in ['DLD_energy', 'DLD_delay']:
+                i = getattr(self, j)
+                mean = np.mean(i)
+                std = np.std(i)
+                min_list = np.where(i < mean-3*std)
+                max_list = np.where(i > mean+3*std)
+                del_list = np.append(min_list, max_list)
+                if del_list.size != 0:
+                    self.DLD_energy = np.delete(self.DLD_energy, del_list)
+                    self.DLD_delay = np.delete(self.DLD_delay, del_list)
+                    self.BAM = np.delete(self.BAM, del_list)
+                    if isinstance(self.GMD, int) is False:
+                        self.GMD = np.delete(self.GMD, del_list)
+                    if isinstance(self.mono, int) is False:
+                        self.mono = np.delete(self.mono, del_list)
+                    self.B_ID = np.delete(self.B_ID, del_list)
+                    self.MB_ID = np.delete(self.MB_ID, del_list)
+                    if isinstance(self.diode, int) is False:
+                        self.diode = np.delete(self.diode, del_list)
+            '''
+            Picking Delay or MB_ID as the ordinate axis.
+            '''
             if ordinate == 'delay':
                 parameter = self.DLD_delay
             elif ordinate == 'MB_ID':
                 parameter = self.MB_ID
-            # rounding of the arrays
-            DLD_delay_r = [self.rounding(i,
-                                         delay_step) for i in parameter]
-            DLD_energy_r = [self.rounding(i,
-                                          energy_step) for i in self.DLD_energy]
+
+            DLD_delay_r = self.rounding(parameter, delay_step)
+            DLD_energy_r = self.rounding(self.DLD_energy, energy_step)
             DLD_delay_r = np.around(DLD_delay_r,
                                     self.decimal_n(delay_step))
             DLD_energy_r = np.around(DLD_energy_r,
                                      self.decimal_n(energy_step))
 
-            '''
-            Here we create a dictionary (delay_info), which stores all
-            delay values as keys.
-            Then, we assign delays to the numbers of count events.
-            '''
-            delay_info = {}
-            DLD_delay_mean = DLD_delay_r.mean()
-            DLD_delay_std = DLD_delay_r.std()
-            if DLD_delay_std == 0:
-                DLD_delay_std = 1
-            for counter, i in enumerate(DLD_delay_r):
-                if abs(i-DLD_delay_mean) < DLD_delay_std*10:
-                    if i not in delay_info.keys():
-                        delay_info[i] = [counter]
-                    else:
-                        delay_info[i].append(counter)
-            '''
-            Further, we sort the dictionary in ascending order of
-            key values (delay values).
-            '''
-            delay_info_sorted = {}
-            for i in sorted(delay_info.keys()):
-                delay_info_sorted[i] = delay_info[i]
+            if config.map_counting == 'classic':
+                '''
+                Here we create a dictionary (delay_info), which stores all
+                delay values as keys.
+                Then, we assign delays to the numbers of count events.
+                '''
+                delay_info = {}
+                DLD_delay_mean = DLD_delay_r.mean()
+                DLD_delay_std = DLD_delay_r.std()
+                if DLD_delay_std == 0:
+                    DLD_delay_std = 1
+                for counter, i in enumerate(DLD_delay_r):
+                    if abs(i-DLD_delay_mean) < DLD_delay_std*10:
+                        if i not in delay_info.keys():
+                            delay_info[i] = [counter]
+                        else:
+                            delay_info[i].append(counter)
+                '''
+                Further, we sort the dictionary in ascending order of
+                key values (delay values).
+                '''
+                delay_info_sorted = {}
+                for i in sorted(delay_info.keys()):
+                    delay_info_sorted[i] = delay_info[i]
 
-            '''
-            Here we create the main database for the whole file:
-                delay_energy_data[i][j][k]
-                i is responsible for the time axis, within every element we
-                have three cells, [j = 0, 1, 2] the first cell stores delay
-                value, the second cell stores a list containing kinetic
-                energies,the third cell contains the number of counts detected.
-            '''
-            delay_energy_data = []
-            for i in delay_info_sorted.keys():
-                energy_info = {}
-                for event in delay_info_sorted[i]:
-                    if DLD_energy_r[event] not in energy_info.keys():
-                        energy_info[DLD_energy_r[event]] = 1
-                    else:
-                        energy_info[DLD_energy_r[event]] += 1
-                for eng in np.arange(min(DLD_energy_r), max(DLD_energy_r)
-                                     + energy_step, energy_step):
-                    if np.around(eng, decimals=
-                                 self.decimal_n(energy_step)) not in energy_info.keys():
-                        energy_info[np.around(eng, decimals=
-                                              self.decimal_n(energy_step))] = 0
-                energy_list = sorted(energy_info.keys())  # Sorting of KE
+                '''
+                Here we create the main database for the whole file:
+                    delay_energy_data[i][j][k]
+                    i is responsible for the time axis, within every element we
+                    have three cells, [j = 0, 1, 2] the first cell stores delay
+                    value, the second cell stores a list containing kinetic
+                    energies,the third cell contains the number of counts detected.
+                '''
+                delay_energy_data = []
+                for i in delay_info_sorted.keys():
+                    energy_info = {}
+                    for event in delay_info_sorted[i]:
+                        if DLD_energy_r[event] not in energy_info.keys():
+                            energy_info[DLD_energy_r[event]] = 1
+                        else:
+                            energy_info[DLD_energy_r[event]] += 1
+                    for eng in np.arange(min(DLD_energy_r), max(DLD_energy_r)
+                                         + energy_step, energy_step):
+                        if np.around(eng, decimals=
+                                     self.decimal_n(energy_step)) not in energy_info.keys():
+                            energy_info[np.around(eng, decimals=
+                                                  self.decimal_n(energy_step))] = 0
+                    energy_list = sorted(energy_info.keys())  # Sorting of KE
 
-                intensity_list = []
-                for energy in energy_list:  # Sorting of Counts along KE
-                    intensity_list.append(energy_info[energy])
-                delay_energy_data.append([i, energy_list, intensity_list])
-                # Every cycle creates a cell [delay, [KE], [Counts]]
+                    intensity_list = []
+                    for energy in energy_list:  # Sorting of Counts along KE
+                        intensity_list.append(energy_info[energy])
+                    delay_energy_data.append([i, energy_list, intensity_list])
+                    # Every cycle creates a cell [delay, [KE], [Counts]]
 
-            '''
+                '''
 
-            CREATING ENERGY-DELAY MAP
+                CREATING ENERGY-DELAY MAP
 
-            image_data - the map itself
-            image_data_x - dictionary, where keys correspond to energy values,
-            values correspond to the number of pixels along the x-axis
-            image_data_y - dictionary, where keys() correspond to delay,
-            values() correspond to the number of pixels along the y-axis
+                image_data - the map itself
+                image_data_x - dictionary, where keys correspond to energy values,
+                values correspond to the number of pixels along the x-axis
+                image_data_y - dictionary, where keys() correspond to delay,
+                values() correspond to the number of pixels along the y-axis
 
-            '''
-            image_data = []
-            for i in delay_energy_data:
-                image_data.append(i[2])
+                '''
+                image_data = []
+                for i in delay_energy_data:
+                    image_data.append(i[2])
 
-            image_data_x = []
-            for i in delay_energy_data[0][1]:
-                image_data_x.append(i)
+                image_data_x = []
+                for i in delay_energy_data[0][1]:
+                    image_data_x.append(i)
 
-            image_data_y = []
-            for i in delay_energy_data:
-                image_data_y.append(i[0])
+                image_data_y = []
+                for i in delay_energy_data:
+                    image_data_y.append(i[0])
+
+            else:
+                image_data_x = np.arange(DLD_energy_r.min(),
+                                         DLD_energy_r.max()+energy_step,
+                                         energy_step)
+                image_data_x = np.around(image_data_x,
+                                         self.decimal_n(energy_step))
+                image_data_y = np.arange(DLD_delay_r.min(),
+                                         DLD_delay_r.max()+delay_step,
+                                         delay_step)
+                image_data_y = np.around(image_data_y,
+                                         self.decimal_n(delay_step))
+
+                image_data = []
+                for i in image_data_y:
+                    array_1 = DLD_energy_r[np.where(DLD_delay_r == i)]
+                    line = []
+                    array_1 = array_1.astype('f')
+                    for j in image_data_x:
+                        array_2 = np.where(array_1 == j)[0]
+                        line.append(array_2.shape[0])
+                    image_data.append(line)
 
             coords = {"Delay stage values": ("Delay", image_data_y),
                       "Kinetic energy": ("Energy", image_data_x)}
@@ -893,10 +1037,13 @@ class read_file:
 
             self.delay_energy_map = delay_energy_map
             self.delay_energy_map_plot = self.delay_energy_map
-            if save is True and self.ordinate == 'delay':
+            if save == 'on' and self.ordinate == 'delay':
                 self.delay_energy_map.to_netcdf(save_path)
                 print('Delay-energy map saved as:')
                 print(save_path)
+            end = timer()
+            print(f'Run {self.run_num} done')
+            print(f'Elapsed time: {round(end-start, 1)} s')
 
     def time_zero(self, t0=1328.2):
         '''
@@ -914,8 +1061,14 @@ class read_file:
         This method generates a difference map by averaging data before
         -0.25 ps and subtracting it from the delay-energy map.
         '''
-        attrs = self.delay_energy_map.attrs
-        norm = self.delay_energy_map.loc[-0.25:].mean('Delay')
+        attrs = self.delay_energy_map_plot.attrs
+        t_axis_step = self.delay_energy_map_plot.coords['Delay'].values
+        try:
+            t_axis_step = abs(np.median(np.gradient(t_axis_step)))
+        except ValueError:
+            t_axis_step = 1
+        t_axis_step = int(-2.5*t_axis_step)
+        norm = self.delay_energy_map.loc[t_axis_step:].mean('Delay')
         self.delay_energy_map_dif = self.delay_energy_map_plot - norm
         self.delay_energy_map_dif.attrs = attrs
 
@@ -953,9 +1106,9 @@ class read_file:
         x - input value
         y - desired step
         '''
-        result = (x // y) * y
-        if (x / y) - (x // y) >= 0.5:
-            result = result + y
+        result = np.floor(x/y)*y
+        check = (x / y) - np.floor(x/y)
+        result = result + (check >= 0.5)*y
         return result
 
     @staticmethod
@@ -991,6 +1144,12 @@ class map_cut:
         self.file_dir = obj.file_dir
         self.ordinate = obj.ordinate
         self.plot_dif = False
+        self.plot_dif = False
+        self.delay_energy_map_plot = obj.delay_energy_map_plot
+        try:
+            self.varied_y_step = obj.varied_y_step
+        except AttributeError:
+            pass
         if isinstance(positions, list) is False:
             positions = [positions]
         if isinstance(deltas, list) is False:
@@ -1061,6 +1220,7 @@ class map_cut:
         Method for fitting of the very first slice with singular Voigt curve.
         It is supposed to be used for finding time zero.
         '''
+        e_axis_step = np.gradient(self.delay_energy_map_plot.coords['Energy'].values).mean()
         x = self.coords
         y = self.cuts[0]
 
@@ -1072,18 +1232,19 @@ class map_cut:
 
         # create parameters with initial values
         params = model.make_params(amplitude=amplitude_g, center=center_g,
-                                   sigma=0.1, gamma=0.1, c=c_g)
+                                   sigma=abs(e_axis_step)*2,
+                                   gamma=abs(e_axis_step)*2, c=c_g)
 
         # maybe place bounds on some parameters
         params['center'].min = np.min(x)
         params['center'].max = np.max(x)
-        params['sigma'].min = 0.01
-        params['sigma'].max = 0.5
-        params['gamma'].min = 0.01
-        params['gamma'].max = 0.5
+        params['sigma'].min = abs(e_axis_step)
+        params['sigma'].max = abs(e_axis_step)*200
+        params['gamma'].min = abs(e_axis_step)
+        params['gamma'].max = abs(e_axis_step)*200
         if amplitude_g != 0:
             params['amplitude'].min = amplitude_g/10
-            params['amplitude'].max = amplitude_g*10
+            params['amplitude'].max = amplitude_g*100
         if np.min(y) + np.max(y) != 0:
             params['c'].min = np.min(y)
             params['c'].max = np.max(y)
@@ -1501,6 +1662,11 @@ class plot_files:
         self.fig = fig
 
     def span_plot(self, cut_obj):
+        self.delay_energy_map_plot = cut_obj.delay_energy_map_plot
+        try:
+            self.varied_y_step = cut_obj.varied_y_step
+        except AttributeError:
+            self.varied_y_step = 'ND'
         '''
         Method which highlights regions on delay-energy map related to
         slices of map_cut objects.
@@ -1520,6 +1686,18 @@ class plot_files:
                                           linewidth=2, zorder=10, alpha=0.4,
                                           linestyle='--')
                         else:
+                            if self.varied_y_step != 'ND':
+                                if self.varied_y_step is True:
+                                    coord = self.delay_energy_map_plot.coords['Delay']
+                                    position = coord.sel(Delay=position, method="nearest")
+                                    limit_1 = coord.sel(Delay=limit_1, method="nearest")
+                                    limit_2 = coord.sel(Delay=limit_2, method="nearest")
+                                    position = coord.where(coord==position,drop=True)
+                                    limit_1 = coord.where(coord==limit_1,drop=True)
+                                    limit_2 = coord.where(coord==limit_2,drop=True)
+                                    position = position['Delay index'].values
+                                    limit_1 = limit_1['Delay index'].values
+                                    limit_2 = limit_2['Delay index'].values
                             i.axhspan(limit_1, limit_2,
                                       facecolor=color_dict[counter],
                                       alpha=0.25)
@@ -1555,21 +1733,15 @@ if __name__ == "__main__":
 
     file_dir = 'D:/Data/Extension_2021_final'
     run_numbers = [37378, 37379, 37380, 37381, 37382, 37383]
-    b = create_batch(file_dir, run_numbers)
-    ts = calendar.timegm(gmtime())
-    date_time = datetime.fromtimestamp(ts)
-    str_date_time = date_time.strftime("%H-%M-%S")
-    print(str_date_time)
+    # run_numbers = [37333, 37334, 37335, 37336, 37337, 37341, 37342, 37343, 37344, 37346, 37347, 37348, 37327,37328,37329,37330]
+    # run_numbers = [37292,37293,37294,37299,37300,37302,37303,37312,37313,37314,37318,37319,37320]
+    b = create_batch(file_dir, run_numbers, DLD='DLD4Q')
     for i in b.batch_list:
         i.create_map(energy_step=0.05, delay_step=0.1, ordinate='delay',
-                     save=False)
+                     save='off')
     b.create_map()
     b.norm_total_e()
-    ts = calendar.timegm(gmtime())
-    date_time = datetime.fromtimestamp(ts)
-    str_date_time = date_time.strftime("%H-%M-%S")
-    print(str_date_time)
-    plot = plot_files([b])
+    plot_files([b])
 else:
     # Loading configs from json file.
     try:

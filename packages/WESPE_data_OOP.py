@@ -185,6 +185,11 @@ class create_batch:
             else:
                 total_map = total_map + i.delay_energy_map
         total_map.attrs = attrs
+        try:
+            total_map.coords['Binding energy']
+            total_map.coords['Kinetic energy']
+        except KeyError:
+            total_map = xr.DataArray([])
         if np.min(total_map.values.shape) == 0:
             concat_list = []
             for counter, i in enumerate(self.batch_list):
@@ -209,6 +214,9 @@ class create_batch:
         shape = total_map.coords['Delay'].values.shape[0]
         total_map.coords['Delay index'] = ('Delay', np.arange(shape))
         self.delay_energy_map = total_map.fillna(0)
+        self.delay_energy_map = self.delay_energy_map.where(self.delay_energy_map.coords['Kinetic energy'].notnull(), drop=True)
+        if np.median(np.gradient(self.delay_energy_map.coords['Binding energy'].values)) > 0:
+            self.delay_energy_map=self.delay_energy_map.isel(Energy=slice(None, None, -1))
         self.delay_energy_map_plot = self.delay_energy_map
 
     def create_dif_map(self):
@@ -1018,6 +1026,7 @@ class read_file:
                                             coords=coords)
             delay_energy_map.name = 'Run ' + str(self.run_num)
             BE = self.mono_mean - np.array(image_data_x) - 4.5
+            BE = np.around(self.rounding(BE, energy_step), self.decimal_n(energy_step))
             delay_energy_map.coords['Binding energy'] = ('Energy', BE)
 
             delay_energy_map.coords['Energy'] = delay_energy_map.coords['Kinetic energy']
@@ -1735,12 +1744,18 @@ if __name__ == "__main__":
     run_numbers = [37378, 37379, 37380, 37381, 37382, 37383]
     # run_numbers = [37333, 37334, 37335, 37336, 37337, 37341, 37342, 37343, 37344, 37346, 37347, 37348, 37327,37328,37329,37330]
     # run_numbers = [37292,37293,37294,37299,37300,37302,37303,37312,37313,37314,37318,37319,37320]
+    run_numbers = [36732,36733,36734,36778,36779,36780,36781,36782,36783]
+    # run_numbers = [36732,36733,36734]
+    run_numbers = [37262,37266]
     b = create_batch(file_dir, run_numbers, DLD='DLD4Q')
     for i in b.batch_list:
-        i.create_map(energy_step=0.05, delay_step=0.1, ordinate='delay',
+        i.create_map(energy_step=0.01, delay_step=0.1, ordinate='delay',
                      save='off')
+        # i.set_BE()
     b.create_map()
     b.norm_total_e()
+    # b.set_BE()
+    # c = map_cut(b, [101], [0.3], axis='Energy axis')
     plot_files([b])
 else:
     # Loading configs from json file.
